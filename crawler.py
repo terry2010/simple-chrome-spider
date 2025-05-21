@@ -77,8 +77,15 @@ class ChromeTask:
         logger.info(f"启动Chrome任务: {self.task_id}, URL: {self.url}")
         
         # 使用系统已安装的chromedriver
-        service = Service(executable_path="/usr/local/bin/chromedriver")
-        self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        try:
+            # 先尝试使用系统路径
+            service = Service()
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        except Exception as e:
+            logger.warning(f"使用默认路径失败: {str(e)}, 尝试指定路径")
+            # 如果失败，尝试指定路径
+            service = Service(executable_path="/usr/local/bin/chromedriver")
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
         
     def execute(self):
         """执行Chrome任务"""

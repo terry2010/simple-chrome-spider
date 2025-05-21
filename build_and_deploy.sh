@@ -2,7 +2,7 @@
 
 # 设置版本号
 VERSION=$(date +%Y%m%d%H%M)
-IMAGE_NAME="headless-chrome-crawler"
+IMAGE_NAME="terry2010/simple-chrome-spider"
 FULL_IMAGE_NAME="${IMAGE_NAME}:${VERSION}"
 
 echo "构建 Docker 镜像: ${FULL_IMAGE_NAME}"
