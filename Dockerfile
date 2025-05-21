@@ -23,7 +23,8 @@ RUN apt-get update && apt-get install -y \
     && chmod +x /usr/local/bin/chromedriver \
     && rm -rf /var/lib/apt/lists/*
 
-# 创建工作目录
+# 创建工作目录和日志目录
+RUN mkdir -p /logs && chmod 777 /logs
 WORKDIR /app
 
 # 复制应用代码和依赖

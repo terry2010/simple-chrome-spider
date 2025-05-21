@@ -7,6 +7,7 @@ import time
 import logging
 import signal
 import sys
+import subprocess
 from datetime import datetime
 from typing import Dict, Optional, List
 import threading
@@ -14,7 +15,6 @@ import redis
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 
 # 配置日志
 logging.basicConfig(
@@ -48,6 +48,10 @@ class Config:
         self.chrome_task_duration = int(os.getenv("CHROME_TASK_DURATION", "60"))
         self.chrome_idle_timeout = int(os.getenv("CHROME_IDLE_TIMEOUT", "300"))
         self.chrome_max_memory = os.getenv("CHROME_MAX_MEMORY", "1GB")
+        
+        # 状态统计配置
+        self.stats_log_path = os.getenv("STATS_LOG_PATH", "/logs/statics.log")
+        self.stats_update_interval = int(os.getenv("STATS_UPDATE_INTERVAL", "10"))  # 每10秒更新一次状态
 
 class ChromeTask:
     """Chrome任务类，管理单个Chrome任务的生命周期"""
@@ -75,6 +79,24 @@ class ChromeTask:
         chrome_options.add_argument("--window-size=1920,1080")
         
         logger.info(f"启动Chrome任务: {self.task_id}, URL: {self.url}")
+        
+        # 确保 chromedriver 存在并可执行
+        try:
+            # 检查chromedriver是否存在
+            subprocess.run(["which", "chromedriver"], check=True, stdout=subprocess.PIPE)
+            logger.info("chromedriver已安装并在PATH中")
+        except subprocess.CalledProcessError:
+            logger.warning("chromedriver不在PATH中，尝试安装")
+            try:
+                # 尝试安装chromedriver
+                subprocess.run(["apt-get", "update"], check=True)
+                subprocess.run(["apt-get", "install", "-y", "chromium-driver"], check=True)
+                subprocess.run(["ln", "-sf", "/usr/bin/chromedriver", "/usr/local/bin/chromedriver"], check=True)
+                subprocess.run(["chmod", "+x", "/usr/local/bin/chromedriver"], check=True)
+                logger.info("chromedriver安装成功")
+            except Exception as e:
+                logger.error(f"chromedriver安装失败: {str(e)}")
+                raise
         
         # 使用系统已安装的chromedriver
         try:
@@ -109,6 +131,9 @@ class ChromeTask:
                 self.scroll_count += 1
                 logger.info(f"Task {self.task_id} - 滚动第 {self.scroll_count} 次")
                 
+                # 更新任务详情中的滚动次数
+                self._update_task_details()
+                
                 # 等待滚动间隔
                 time.sleep(self.config.chrome_scroll_interval)
             
@@ -124,6 +149,28 @@ class ChromeTask:
                 logger.info(f"关闭Chrome浏览器实例: {self.task_id}")
             
             self.end_time = datetime.now()
+            
+    def _update_task_details(self):
+        """更新服务中的任务详情"""
+        try:
+            # 获取HeadlessChromeService实例
+            service = self._get_service_instance()
+            if service and hasattr(service, 'task_details') and self.task_id in service.task_details:
+                with service.active_tasks_lock:
+                    service.task_details[self.task_id]['scroll_count'] = self.scroll_count
+                    service.task_details[self.task_id]['status'] = self.status
+        except Exception as e:
+            logger.error(f"更新任务详情时出错: {str(e)}")
+    
+    def _get_service_instance(self):
+        """获取HeadlessChromeService实例"""
+        # 尝试从当前线程中获取服务实例
+        for thread in threading.enumerate():
+            if hasattr(thread, '_target') and thread._target and hasattr(thread._target, '__self__'):
+                target_self = thread._target.__self__
+                if isinstance(target_self, HeadlessChromeService):
+                    return target_self
+        return None
             
     def get_result(self) -> Dict:
         """获取任务执行结果"""
@@ -150,6 +197,11 @@ class HeadlessChromeService:
         self.active_tasks_lock = threading.Lock()
         self.running = True
         self.last_activity_time = time.time()
+        self.task_details = {}  # 存储正在运行的任务详情
+        self.stats_timer = None  # 状态更新定时器
+        
+        # 确保日志目录存在
+        os.makedirs(os.path.dirname(self.config.stats_log_path), exist_ok=True)
         
         # 设置信号处理
         signal.signal(signal.SIGTERM, self._handle_shutdown)
@@ -267,6 +319,15 @@ class HeadlessChromeService:
         
         logger.info(f"处理任务: {task_id}, URL: {url}")
         
+        # 记录任务详情
+        with self.active_tasks_lock:
+            self.task_details[task_id] = {
+                "url": url,
+                "start_time": datetime.now().isoformat(),
+                "status": "running",
+                "scroll_count": 0
+            }
+        
         # 创建并执行Chrome任务
         task = ChromeTask(task_id, url, self.config)
         task.execute()
@@ -279,6 +340,8 @@ class HeadlessChromeService:
         with self.active_tasks_lock:
             if task_id in self.active_tasks:
                 del self.active_tasks[task_id]
+            if task_id in self.task_details:
+                del self.task_details[task_id]
                 
         logger.info(f"任务完成: {task_id}, 状态: {result['status']}")
     
@@ -301,12 +364,79 @@ class HeadlessChromeService:
         thread.start()
         logger.info(f"启动任务线程: {task_id}")
     
+    def _write_stats_to_log(self):
+        """将当前状态写入日志文件"""
+        try:
+            current_time = datetime.now().isoformat()
+            with self.active_tasks_lock:
+                active_count = len(self.active_tasks)
+                task_info = list(self.task_details.values())
+            
+            # 获取系统资源信息
+            mem_info = self._get_memory_usage()
+            cpu_info = self._get_cpu_usage()
+            
+            # 构建状态信息
+            stats = {
+                "timestamp": current_time,
+                "active_tasks": active_count,
+                "memory_usage_mb": mem_info,
+                "cpu_usage_percent": cpu_info,
+                "running_tasks": task_info
+            }
+            
+            # 写入日志文件
+            with open(self.config.stats_log_path, 'w') as f:
+                json.dump(stats, f, indent=2, ensure_ascii=False)
+                
+            logger.debug(f"已将状态信息写入: {self.config.stats_log_path}")
+            
+            # 设置下一次状态更新
+            self.stats_timer = threading.Timer(self.config.stats_update_interval, self._write_stats_to_log)
+            self.stats_timer.daemon = True
+            self.stats_timer.start()
+            
+        except Exception as e:
+            logger.error(f"写入状态日志时出错: {str(e)}")
+            # 即使出错也要继续定时器
+            self.stats_timer = threading.Timer(self.config.stats_update_interval, self._write_stats_to_log)
+            self.stats_timer.daemon = True
+            self.stats_timer.start()
+    
+    def _get_memory_usage(self):
+        """获取当前内存使用情况"""
+        try:
+            # 使用ps命令获取内存使用情况
+            cmd = "ps -o rss= -p %d" % os.getpid()
+            output = subprocess.check_output(cmd, shell=True).decode('utf-8').strip()
+            memory_kb = int(output)
+            memory_mb = memory_kb / 1024  # 转换为MB
+            return round(memory_mb, 2)
+        except Exception as e:
+            logger.error(f"获取内存使用情况时出错: {str(e)}")
+            return 0
+    
+    def _get_cpu_usage(self):
+        """获取CPU使用率"""
+        try:
+            # 使用top命令获取CPU使用率
+            cmd = f"top -b -n 1 -p {os.getpid()} | grep {os.getpid()}"
+            output = subprocess.check_output(cmd, shell=True).decode('utf-8')
+            cpu_usage = float(output.split()[8])
+            return cpu_usage
+        except Exception as e:
+            logger.error(f"获取CPU使用率时出错: {str(e)}")
+            return 0
+    
     def run(self):
         """运行服务主循环，永久运行"""
         logger.info("无头Chrome服务启动...")
         
         # 启动时清理可能存在的Chrome进程
         self._cleanup_chrome_processes()
+        
+        # 启动状态统计定时器
+        self._write_stats_to_log()
         
         while True:  # 永久运行，不使用self.running标志
             try:
