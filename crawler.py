@@ -188,14 +188,50 @@ class HeadlessChromeService:
         sys.exit(0)
     
     def _check_idle_timeout(self):
-        """检查空闲超时"""
+        """检查空闲超时，关闭Chrome实例但不退出服务"""
         current_time = time.time()
         if current_time - self.last_activity_time > self.config.chrome_idle_timeout:
             if not self.active_tasks:
-                logger.info(f"服务空闲超过 {self.config.chrome_idle_timeout} 秒，退出...")
-                self.running = False
-                return True
+                logger.info(f"服务空闲超过 {self.config.chrome_idle_timeout} 秒，清理资源...")
+                self._cleanup_chrome_processes()
+                # 不退出服务，保持运行
+                return False
         return False
+        
+    def _cleanup_chrome_processes(self):
+        """清理所有Chrome进程"""
+        try:
+            import subprocess
+            import os
+            import signal
+            
+            # 查找所有Chrome进程
+            logger.info("检查并清理所有Chrome进程...")
+            
+            # 使用ps命令查找Chrome相关进程
+            ps_cmd = "ps aux | grep -E 'chrome|chromedriver' | grep -v grep"
+            process = subprocess.Popen(ps_cmd, shell=True, stdout=subprocess.PIPE)
+            output, _ = process.communicate()
+            
+            if output:
+                lines = output.decode('utf-8').strip().split('\n')
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) > 1:
+                        pid = parts[1]
+                        try:
+                            pid = int(pid)
+                            os.kill(pid, signal.SIGTERM)
+                            logger.info(f"终止Chrome相关进程: PID {pid}")
+                        except (ValueError, ProcessLookupError) as e:
+                            logger.error(f"无法终止进程 {pid}: {str(e)}")
+                logger.info("所有Chrome相关进程已清理")
+            else:
+                logger.info("没有发现运行中的Chrome进程")
+                
+        except Exception as e:
+            logger.error(f"清理Chrome进程时出错: {str(e)}")
+            # 即使出错也不影响主服务运行
     
     def _fetch_task(self) -> Optional[Dict]:
         """从Redis队列获取任务"""
@@ -266,14 +302,16 @@ class HeadlessChromeService:
         logger.info(f"启动任务线程: {task_id}")
     
     def run(self):
-        """运行服务主循环"""
+        """运行服务主循环，永久运行"""
         logger.info("无头Chrome服务启动...")
         
-        while self.running:
+        # 启动时清理可能存在的Chrome进程
+        self._cleanup_chrome_processes()
+        
+        while True:  # 永久运行，不使用self.running标志
             try:
-                # 检查空闲超时
-                if self._check_idle_timeout():
-                    break
+                # 检查空闲超时，只清理资源不退出
+                self._check_idle_timeout()
                 
                 # 检查是否可以接受新任务
                 with self.active_tasks_lock:
@@ -298,7 +336,10 @@ class HeadlessChromeService:
             except Exception as e:
                 logger.error(f"服务循环中出现未处理的异常: {str(e)}")
                 time.sleep(5)  # 避免错误循环过快
+                
+                # 即使出错也继续运行
         
+        # 注意：这行代码实际上永远不会执行，因为我们使用了无限循环
         logger.info("服务主循环结束")
 
 if __name__ == "__main__":
