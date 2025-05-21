@@ -1,0 +1,58 @@
+新建一个项目， 功能为： 在支持docker的centos 集群上， 搭建无头chrome。 功能是用无头chrome 打开url，并每隔3秒往下翻一页（类似按page down效果）。 1分钟后关闭url。 在闲时要关闭chrome以节省服务器资源。
+
+设计流程为： 有一个不停被写入任务url的redis queue 。 这个使用无头chrome的服务会一直消耗这个queue， 每有一个新的任务就新起一个chrome浏览这个url 一分钟。
+queue里的数据格式为 {"url":"http://网址","add_time":"这个不用处理"} 。 在处理完以后把处理结果存到redis的另一个queue里面。
+
+编程语言使用python 。 要有频控策略，能设置单个服务器最多同时启动多少个chrome任务。和其他必要策略。
+
+注意 服务器不支持 docker-composer 和k8s 。 我希望是 到新服务器上启动一个docker 容器他就能开始运行。 在启动容器的时候可以指定各种参数， 比如最大任务数，最大内存， redis服务器ip 密码之类的
+
+
+=======================
+
+# 创建一个项目，功能是在支持Docker的CentOS集群上搭建无头Chrome浏览器
+# 具体功能：
+ 1. 使用无头Chrome打开URL
+ 2. 每隔3秒向下滚动一页（类似PageDown效果）
+ 3. 1分钟后关闭URL
+ 4. 在闲时关闭Chrome以节省服务器资源
+# 设计流程：
+ 1. 有一个持续写入任务URL的Redis队列
+ 2. 服务会不断消耗这个队列
+ 3. 每当有新任务时，就启动一个新的Chrome浏览该URL一分钟
+ 4. 队列中数据格式为 {"url":"http://网址","add_time":"这个不用处理"}
+ 5. 处理完后将结果存储到Redis的另一个队列中
+# 编程语言：Python
+# 需要频控策略，能设置服务器最多同时启动多少个Chrome任务等
+# 服务器不支持docker-compose和k8s，希望在新服务器上启动一个Docker容器即可运行
+# 启动容器时可以指定参数，如最大任务数、最大内存、Redis服务器IP和密码等
+# 一个项目结构，包括：
+
+Dockerfile - 用于构建Docker镜像
+Python脚本 - 实现核心功能
+README.md - 说明文档
+crawler.py - 爬虫脚本
+build_and_deploy.sh - 构建和部署脚本
+start.sh - 启动脚本 - 用于启动Docker容器
+requirements.txt - 依赖文件
+
+# 功能实现
+ 1. 使用Selenium与无头Chrome实现网页自动访问
+ 2. 每3秒自动向下滚动一页（可配置）
+ 3. 每个URL访问1分钟后自动关闭（可配置）
+ 4. 从Redis队列读取任务并将结果写入另一个队列
+ 5. 支持并发控制，可设置最大同时运行Chrome任务数
+ 6. 实现闲时关闭，节省服务器资源
+# 部署方式
+在新服务器上，只需运行类似以下命令即可启动服务：
+docker run -d \
+  --name headless-chrome-crawler \
+  -e REDIS_HOST=<redis服务器IP> \
+  -e REDIS_PORT=6379 \
+  -e REDIS_PASSWORD=<redis密码> \
+  -e MAX_CONCURRENT_TASKS=5 \
+  headless-chrome-crawler:latest
+
+可以通过环境变量灵活配置各种参数，如最大任务数、Redis连接信息等。详细配置参数在README.md文件中详细说明。
+
+注意：项目完全基于Docker，不需要docker-compose或k8s，一个容器就可以完成所有工作 。可以根据需要调整任务并发数、内存限制和其他参数
