@@ -76,7 +76,8 @@ class ChromeTask:
         
         logger.info(f"启动Chrome任务: {self.task_id}, URL: {self.url}")
         
-        service = Service()
+        # 使用系统已安装的chromedriver
+        service = Service(executable_path="/usr/local/bin/chromedriver")
         self.driver = webdriver.Chrome(service=service, options=chrome_options)
         
     def execute(self):
