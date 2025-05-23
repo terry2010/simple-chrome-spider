@@ -19,15 +19,22 @@ RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key
     && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list \
     && apt-get update \
     && apt-get install -y google-chrome-stable \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && echo "已安装Chrome版本:" \
+    && google-chrome --version
 
-# 安装Chromedriver
-RUN CHROME_VERSION=$(google-chrome --version | awk '{print $3}' | cut -d. -f1-3) \
-    && CHROMEDRIVER_VERSION=$(wget -qO- "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_$CHROME_VERSION") \
-    && wget -q "https://chromedriver.storage.googleapis.com/$CHROMEDRIVER_VERSION/chromedriver_linux64.zip" \
+# 显示Chrome版本并安装对应的Chromedriver
+RUN echo "检测到的Chrome版本:" \
+    && CHROME_VERSION=$(google-chrome --version | awk '{print $3}') \
+    && echo "Chrome版本: $CHROME_VERSION" \
+    && CHROME_MAJOR_VERSION=$(echo "$CHROME_VERSION" | cut -d. -f1) \
+    && echo "Chrome主版本号: $CHROME_MAJOR_VERSION" \
+    && echo "使用固定版本的ChromeDriver: 114.0.5735.90" \
+    && wget -q https://chromedriver.storage.googleapis.com/114.0.5735.90/chromedriver_linux64.zip \
     && unzip chromedriver_linux64.zip -d /usr/local/bin \
     && rm chromedriver_linux64.zip \
-    && chmod +x /usr/local/bin/chromedriver
+    && chmod +x /usr/local/bin/chromedriver \
+    && echo "ChromeDriver已安装到: /usr/local/bin/chromedriver"
 
 # 复制需求文件并安装依赖
 COPY requirements.txt .
