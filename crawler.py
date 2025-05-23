@@ -1,477 +1,505 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
 import json
-import time
 import logging
+import os
 import signal
 import sys
-import subprocess
-from datetime import datetime
-from typing import Dict, Optional, List
+import time
+import base64
 import threading
-import redis
+import traceback
+from datetime import datetime
+from io import BytesIO
+import requests
+from PIL import Image
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
+import redis
 
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout)
+        logging.StreamHandler(),
+        logging.FileHandler('/logs/crawler.log')
     ]
 )
-logger = logging.getLogger("HeadlessChromeService")
+logger = logging.getLogger(__name__)
+
+# 静态状态日志
+STATS_LOG_PATH = '/logs/statics.log'
 
 class Config:
     """配置类，从环境变量读取配置"""
     
-    def __init__(self):
-        # Redis配置
-        self.redis_host = os.getenv("REDIS_HOST", "localhost")
-        self.redis_port = int(os.getenv("REDIS_PORT", "6379"))
-        self.redis_password = os.getenv("REDIS_PASSWORD", "")
-        self.redis_db = int(os.getenv("REDIS_DB", "0"))
-        
-        # 任务队列配置
-        self.task_queue_key = os.getenv("TASK_QUEUE_KEY", "headless_chrome_tasks")
-        self.result_queue_key = os.getenv("RESULT_QUEUE_KEY", "headless_chrome_results")
-        
-        # 并发控制
-        self.max_concurrent_tasks = int(os.getenv("MAX_CONCURRENT_TASKS", "3"))
-        
-        # Chrome配置
-        self.chrome_scroll_interval = float(os.getenv("CHROME_SCROLL_INTERVAL", "3.0"))
-        self.chrome_task_duration = int(os.getenv("CHROME_TASK_DURATION", "60"))
-        self.chrome_idle_timeout = int(os.getenv("CHROME_IDLE_TIMEOUT", "300"))
-        self.chrome_max_memory = os.getenv("CHROME_MAX_MEMORY", "1GB")
-        
-        # 状态统计配置
-        self.stats_log_path = os.getenv("STATS_LOG_PATH", "/logs/statics.log")
-        self.stats_update_interval = int(os.getenv("STATS_UPDATE_INTERVAL", "10"))  # 每10秒更新一次状态
+    # Redis配置
+    REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+    REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+    REDIS_PASSWORD = os.getenv('REDIS_PASSWORD', '')
+    REDIS_DB = int(os.getenv('REDIS_DB', 0))
+    
+    # 队列名称
+    TASK_QUEUE = os.getenv('TASK_QUEUE', 'chrome_crawler_tasks')
+    RESULT_QUEUE = os.getenv('RESULT_QUEUE', 'chrome_crawler_results')
+    
+    # 爬虫配置
+    MAX_CONCURRENT_TASKS = int(os.getenv('MAX_CONCURRENT_TASKS', 5))
+    DEFAULT_SCROLL_INTERVAL = int(os.getenv('DEFAULT_SCROLL_INTERVAL', 3))
+    DEFAULT_VISIT_DURATION = int(os.getenv('DEFAULT_VISIT_DURATION', 60))
+    BROWSER_TIMEOUT = int(os.getenv('BROWSER_TIMEOUT', 30))
+    
+    # 轮询间隔
+    TASK_POLL_INTERVAL = int(os.getenv('TASK_POLL_INTERVAL', 5))
+    
+    # 日志配置
+    STATS_UPDATE_INTERVAL = int(os.getenv('STATS_UPDATE_INTERVAL', 10))
 
 class ChromeTask:
-    """Chrome任务类，管理单个Chrome任务的生命周期"""
+    """Chrome任务类，管理单个Chrome任务"""
     
-    def __init__(self, task_id: str, url: str, config: Config):
-        self.task_id = task_id
-        self.url = url
-        self.config = config
+    def __init__(self, task_data, redis_client):
+        self.task_data = task_data
+        self.redis_client = redis_client
         self.driver = None
         self.start_time = None
         self.end_time = None
-        self.status = "pending"
+        self.urls_visited = []
+        self.current_url = None
+        self.browser_logs = []
+        self.screenshot = None
+        self.page_source = None
+        self.page_title = None
+        self.console_logs = []
+        self.success = False
         self.error = None
-        self.scroll_count = 0
+        self.custom_result = {}
         
-    def setup_driver(self):
-        """设置并启动Chrome驱动"""
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument(f"--disable-extensions")
-        chrome_options.add_argument(f"--memory-limit={self.config.chrome_max_memory}")
-        chrome_options.add_argument("--window-size=1920,1080")
-        
-        logger.info(f"启动Chrome任务: {self.task_id}, URL: {self.url}")
-        
-        # 确保 chromedriver 存在并可执行
+    def start(self):
+        """启动Chrome任务"""
         try:
-            # 检查chromedriver是否存在
-            subprocess.run(["which", "chromedriver"], check=True, stdout=subprocess.PIPE)
-            logger.info("chromedriver已安装并在PATH中")
-        except subprocess.CalledProcessError:
-            logger.warning("chromedriver不在PATH中，尝试安装")
-            try:
-                # 尝试安装chromedriver
-                subprocess.run(["apt-get", "update"], check=True)
-                subprocess.run(["apt-get", "install", "-y", "chromium-driver"], check=True)
-                subprocess.run(["ln", "-sf", "/usr/bin/chromedriver", "/usr/local/bin/chromedriver"], check=True)
-                subprocess.run(["chmod", "+x", "/usr/local/bin/chromedriver"], check=True)
-                logger.info("chromedriver安装成功")
-            except Exception as e:
-                logger.error(f"chromedriver安装失败: {str(e)}")
-                raise
-        
-        # 使用系统已安装的chromedriver
-        try:
-            # 先尝试使用系统路径
-            service = Service()
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-        except Exception as e:
-            logger.warning(f"使用默认路径失败: {str(e)}, 尝试指定路径")
-            # 如果失败，尝试指定路径
-            service = Service(executable_path="/usr/local/bin/chromedriver")
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-        
-    def execute(self):
-        """执行Chrome任务"""
-        try:
-            self.status = "running"
             self.start_time = datetime.now()
+            url = self.task_data.get('url')
+            if not url:
+                raise ValueError("任务中未提供URL")
+                
+            # 记录初始URL
+            self.current_url = url
+            self.urls_visited.append({
+                'url': url,
+                'time': self.start_time.isoformat()
+            })
             
             # 启动浏览器
-            self.setup_driver()
+            logger.info(f"启动Chrome访问: {url}")
+            self._setup_browser()
             
             # 访问URL
-            self.driver.get(self.url)
-            logger.info(f"成功访问URL: {self.url}")
+            self.driver.get(url)
             
-            end_time = time.time() + self.config.chrome_task_duration
+            # 执行任务配置中的操作
+            self._execute_task_actions()
             
-            # 每隔指定时间向下滚动，直到达到总时长
-            while time.time() < end_time:
-                # 向下滚动
-                self.driver.execute_script("window.scrollBy(0, window.innerHeight);")
-                self.scroll_count += 1
-                logger.info(f"Task {self.task_id} - 滚动第 {self.scroll_count} 次")
-                
-                # 更新任务详情中的滚动次数
-                self._update_task_details()
-                
-                # 等待滚动间隔
-                time.sleep(self.config.chrome_scroll_interval)
+            # 收集结果
+            self._collect_results()
             
-            self.status = "completed"
+            self.success = True
             
         except Exception as e:
-            self.status = "failed"
             self.error = str(e)
-            logger.error(f"任务 {self.task_id} 执行失败: {str(e)}")
+            logger.error(f"任务执行失败: {str(e)}")
+            logger.error(traceback.format_exc())
         finally:
-            if self.driver:
-                self.driver.quit()
-                logger.info(f"关闭Chrome浏览器实例: {self.task_id}")
-            
             self.end_time = datetime.now()
-            
-    def _update_task_details(self):
-        """更新服务中的任务详情"""
-        try:
-            # 获取HeadlessChromeService实例
-            service = self._get_service_instance()
-            if service and hasattr(service, 'task_details') and self.task_id in service.task_details:
-                with service.active_tasks_lock:
-                    service.task_details[self.task_id]['scroll_count'] = self.scroll_count
-                    service.task_details[self.task_id]['status'] = self.status
-        except Exception as e:
-            logger.error(f"更新任务详情时出错: {str(e)}")
+            self._quit_browser()
+            self._save_results()
     
-    def _get_service_instance(self):
-        """获取HeadlessChromeService实例"""
-        # 尝试从当前线程中获取服务实例
-        for thread in threading.enumerate():
-            if hasattr(thread, '_target') and thread._target and hasattr(thread._target, '__self__'):
-                target_self = thread._target.__self__
-                if isinstance(target_self, HeadlessChromeService):
-                    return target_self
-        return None
-            
-    def get_result(self) -> Dict:
-        """获取任务执行结果"""
-        duration = (self.end_time - self.start_time).total_seconds() if self.end_time else 0
+    def _setup_browser(self):
+        """设置Chrome浏览器"""
+        options = Options()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
         
-        return {
-            "task_id": self.task_id,
-            "url": self.url,
-            "start_time": self.start_time.isoformat() if self.start_time else None,
-            "end_time": self.end_time.isoformat() if self.end_time else None,
-            "duration": duration,
-            "status": self.status,
-            "error": self.error,
-            "scroll_count": self.scroll_count
+        # 启用JavaScript和控制台日志记录
+        options.add_argument('--enable-logging')
+        options.add_experimental_option('excludeSwitches', ['enable-automation'])
+        options.add_experimental_option('useAutomationExtension', False)
+        
+        service = Service()
+        self.driver = webdriver.Chrome(service=service, options=options)
+        self.driver.set_page_load_timeout(Config.BROWSER_TIMEOUT)
+        
+        # 注入JavaScript以捕获控制台日志
+        self.driver.execute_cdp_cmd('Runtime.enable', {})
+        self.driver.execute_cdp_cmd('Console.enable', {})
+        
+    def _quit_browser(self):
+        """关闭浏览器"""
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception as e:
+                logger.error(f"关闭浏览器时出错: {str(e)}")
+            finally:
+                self.driver = None
+    
+    def _execute_task_actions(self):
+        """执行任务配置中的操作"""
+        task_actions = self.task_data.get('task', [])
+        
+        if not task_actions:
+            # 如果没有特定操作，则执行默认操作（滚动页面1分钟）
+            self._default_scroll_behavior()
+            return
+        
+        for action in task_actions:
+            action_type = action.get('do')
+            
+            if action_type == 'page_down':
+                self._scroll_page_down()
+            elif action_type == 'sleep':
+                sleep_time = action.get('time', Config.DEFAULT_SCROLL_INTERVAL)
+                time.sleep(sleep_time)
+            elif action_type == 'screenshot':
+                self._take_screenshot()
+            elif action_type == 'get_title':
+                self.page_title = self.driver.title
+            elif action_type == 'get_source':
+                self.page_source = self.driver.page_source
+            elif action_type == 'get_console_log':
+                self._get_console_logs()
+            else:
+                logger.warning(f"未知的操作类型: {action_type}")
+    
+    def _default_scroll_behavior(self):
+        """默认滚动行为：每3秒滚动一次，持续1分钟"""
+        end_time = time.time() + Config.DEFAULT_VISIT_DURATION
+        
+        while time.time() < end_time:
+            self._scroll_page_down()
+            time.sleep(Config.DEFAULT_SCROLL_INTERVAL)
+            
+            # 检查URL是否变化
+            if self.driver.current_url != self.current_url:
+                self.current_url = self.driver.current_url
+                self.urls_visited.append({
+                    'url': self.current_url,
+                    'time': datetime.now().isoformat()
+                })
+    
+    def _scroll_page_down(self):
+        """向下滚动一页"""
+        try:
+            self.driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.PAGE_DOWN)
+            logger.debug("页面向下滚动")
+        except Exception as e:
+            logger.error(f"页面滚动失败: {str(e)}")
+    
+    def _take_screenshot(self):
+        """截取屏幕截图"""
+        try:
+            screenshot = self.driver.get_screenshot_as_png()
+            img = Image.open(BytesIO(screenshot))
+            buffered = BytesIO()
+            img.save(buffered, format="PNG")
+            self.screenshot = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        except Exception as e:
+            logger.error(f"截图失败: {str(e)}")
+    
+    def _get_console_logs(self):
+        """获取控制台日志"""
+        try:
+            logs = self.driver.get_log('browser')
+            self.console_logs.extend([log['message'] for log in logs])
+        except Exception as e:
+            logger.error(f"获取控制台日志失败: {str(e)}")
+    
+    def _collect_results(self):
+        """收集任务结果"""
+        callback_data = self.task_data.get('callback_data', [])
+        
+        # 确保始终收集默认数据
+        if 'title' in callback_data or True:
+            self.page_title = self.driver.title
+            
+        # 根据callback_data收集自定义结果
+        if 'screenshot' in callback_data:
+            if not self.screenshot:
+                self._take_screenshot()
+            self.custom_result['screenshot'] = self.screenshot
+            
+        if 'page_source' in callback_data or 'html' in callback_data:
+            self.page_source = self.driver.page_source
+            self.custom_result['page_source'] = self.page_source
+            
+        if 'console_log' in callback_data:
+            if not self.console_logs:
+                self._get_console_logs()
+            self.custom_result['console_log'] = self.console_logs
+    
+    def _save_results(self):
+        """保存任务结果"""
+        total_duration = (self.end_time - self.start_time).total_seconds()
+        
+        result = {
+            'task_id': self.task_data.get('task_id', ''),
+            'url': self.task_data.get('url', ''),
+            'start_time': self.start_time.isoformat() if self.start_time else None,
+            'end_time': self.end_time.isoformat() if self.end_time else None,
+            'total_duration': total_duration,
+            'urls_visited': self.urls_visited,
+            'final_url': self.current_url,
+            'success': self.success,
+            'error': self.error,
+            'title': self.page_title,
         }
+        
+        # 添加自定义结果
+        result.update(self.custom_result)
+        
+        # 发送回调（如果配置了）
+        callback_url = self.task_data.get('callback_url')
+        if callback_url:
+            try:
+                requests.post(callback_url, json=result, timeout=10)
+                logger.info(f"已发送回调到: {callback_url}")
+            except Exception as e:
+                logger.error(f"发送回调失败: {str(e)}")
+        
+        # 将结果写入Redis队列
+        try:
+            self.redis_client.lpush(Config.RESULT_QUEUE, json.dumps(result))
+            logger.info(f"已将结果写入队列: {Config.RESULT_QUEUE}")
+        except Exception as e:
+            logger.error(f"写入结果队列失败: {str(e)}")
 
-class HeadlessChromeService:
-    """无头Chrome服务，管理任务队列和Chrome实例"""
+
+class CrawlerManager:
+    """爬虫管理器，管理所有Chrome任务"""
     
     def __init__(self):
-        self.config = Config()
-        self.redis_client = self._connect_redis()
-        self.active_tasks: Dict[str, threading.Thread] = {}
-        self.active_tasks_lock = threading.Lock()
-        self.running = True
-        self.last_activity_time = time.time()
-        self.task_details = {}  # 存储正在运行的任务详情
-        self.stats_timer = None  # 状态更新定时器
+        self.redis_client = None
+        self.running_tasks = {}
+        self.task_semaphore = threading.Semaphore(Config.MAX_CONCURRENT_TASKS)
+        self.stop_event = threading.Event()
+        self.stats_thread = None
         
-        # 确保日志目录存在
-        os.makedirs(os.path.dirname(self.config.stats_log_path), exist_ok=True)
+    def connect_redis(self):
+        """连接Redis"""
+        try:
+            logger.info(f"连接Redis: {Config.REDIS_HOST}:{Config.REDIS_PORT}")
+            self.redis_client = redis.Redis(
+                host=Config.REDIS_HOST,
+                port=Config.REDIS_PORT,
+                password=Config.REDIS_PASSWORD,
+                db=Config.REDIS_DB,
+                decode_responses=True
+            )
+            # 测试连接
+            self.redis_client.ping()
+            logger.info("Redis连接成功")
+            return True
+        except Exception as e:
+            logger.error(f"Redis连接失败: {str(e)}")
+            return False
+    
+    def start(self):
+        """启动爬虫管理器"""
+        if not self.connect_redis():
+            logger.error("无法连接Redis，退出")
+            return False
         
-        # 设置信号处理
+        logger.info(f"爬虫管理器启动，最大并发任务数: {Config.MAX_CONCURRENT_TASKS}")
+        
+        # 启动状态更新线程
+        self.stats_thread = threading.Thread(target=self._update_stats, daemon=True)
+        self.stats_thread.start()
+        
+        # 注册信号处理
         signal.signal(signal.SIGTERM, self._handle_shutdown)
         signal.signal(signal.SIGINT, self._handle_shutdown)
         
-        logger.info(f"无头Chrome服务初始化完成，最大并发任务数: {self.config.max_concurrent_tasks}")
+        # 主循环
+        while not self.stop_event.is_set():
+            try:
+                # 检查是否有任务
+                if self.task_semaphore._value > 0:  # 还有可用的并发槽
+                    task_json = self.redis_client.brpop(Config.TASK_QUEUE, Config.TASK_POLL_INTERVAL)
+                    
+                    if task_json:
+                        _, task_data_str = task_json
+                        self._process_task(task_data_str)
+                else:
+                    # 所有并发槽都在使用中，等待
+                    time.sleep(1)
+                    
+                # 清理已完成的任务
+                self._cleanup_finished_tasks()
+                
+            except Exception as e:
+                logger.error(f"主循环发生错误: {str(e)}")
+                logger.error(traceback.format_exc())
+                time.sleep(Config.TASK_POLL_INTERVAL)
         
-    def _connect_redis(self) -> redis.Redis:
-        """连接到Redis"""
+        # 关闭所有任务
+        self._shutdown()
+        return True
+    
+    def _process_task(self, task_data_str):
+        """处理任务"""
         try:
-            client = redis.Redis(
-                host=self.config.redis_host,
-                port=self.config.redis_port,
-                password=self.config.redis_password,
-                db=self.config.redis_db,
-                decode_responses=True
+            task_data = json.loads(task_data_str)
+            task_id = task_data.get('task_id', str(time.time()))
+            
+            # 设置task_id如果没有
+            if 'task_id' not in task_data:
+                task_data['task_id'] = task_id
+                
+            logger.info(f"收到新任务: {task_id}, URL: {task_data.get('url')}")
+            
+            # 获取信号量
+            self.task_semaphore.acquire()
+            
+            # 创建并启动任务线程
+            task = ChromeTask(task_data, self.redis_client)
+            task_thread = threading.Thread(
+                target=self._run_task,
+                args=(task_id, task),
+                daemon=True
             )
-            client.ping()
-            logger.info(f"成功连接到Redis: {self.config.redis_host}:{self.config.redis_port}")
-            return client
-        except redis.ConnectionError as e:
-            logger.error(f"无法连接到Redis: {str(e)}")
-            sys.exit(1)
+            
+            self.running_tasks[task_id] = {
+                'thread': task_thread,
+                'task': task,
+                'start_time': datetime.now()
+            }
+            
+            task_thread.start()
+            logger.info(f"任务 {task_id} 已启动")
+            
+        except json.JSONDecodeError:
+            logger.error(f"无效的任务数据格式: {task_data_str}")
+        except Exception as e:
+            logger.error(f"处理任务时出错: {str(e)}")
+            logger.error(traceback.format_exc())
+            self.task_semaphore.release()  # 释放信号量
+    
+    def _run_task(self, task_id, task):
+        """运行任务的线程函数"""
+        try:
+            task.start()
+        except Exception as e:
+            logger.error(f"任务 {task_id} 执行失败: {str(e)}")
+            logger.error(traceback.format_exc())
+        finally:
+            self.task_semaphore.release()  # 释放信号量
+    
+    def _cleanup_finished_tasks(self):
+        """清理已完成的任务"""
+        finished_tasks = []
+        
+        for task_id, task_info in self.running_tasks.items():
+            if not task_info['thread'].is_alive():
+                finished_tasks.append(task_id)
+        
+        for task_id in finished_tasks:
+            logger.info(f"任务 {task_id} 已完成")
+            self.running_tasks.pop(task_id, None)
+    
+    def _update_stats(self):
+        """更新状态统计信息"""
+        while not self.stop_event.is_set():
+            try:
+                stats = {
+                    'timestamp': datetime.now().isoformat(),
+                    'running_tasks': len(self.running_tasks),
+                    'max_concurrent_tasks': Config.MAX_CONCURRENT_TASKS,
+                    'available_slots': self.task_semaphore._value,
+                    'tasks': []
+                }
+                
+                # 添加正在运行的任务信息
+                for task_id, task_info in self.running_tasks.items():
+                    task = task_info['task']
+                    start_time = task_info['start_time']
+                    duration = (datetime.now() - start_time).total_seconds()
+                    
+                    stats['tasks'].append({
+                        'task_id': task_id,
+                        'url': task.task_data.get('url', ''),
+                        'start_time': start_time.isoformat(),
+                        'duration': duration
+                    })
+                
+                # 写入状态日志
+                with open(STATS_LOG_PATH, 'w') as f:
+                    json.dump(stats, f, indent=2)
+                    
+                time.sleep(Config.STATS_UPDATE_INTERVAL)
+            except Exception as e:
+                logger.error(f"更新状态统计信息失败: {str(e)}")
+                time.sleep(Config.STATS_UPDATE_INTERVAL)
     
     def _handle_shutdown(self, signum, frame):
         """处理关闭信号"""
-        logger.info("接收到关闭信号，正在优雅退出...")
-        self.running = False
-        
-        # 等待所有活跃任务完成
-        logger.info("等待所有活跃任务完成...")
-        for task_id, thread in list(self.active_tasks.items()):
-            thread.join()
-            
-        logger.info("服务已退出")
-        sys.exit(0)
+        logger.info(f"收到信号 {signum}，准备关闭")
+        self.stop_event.set()
     
-    def _check_idle_timeout(self):
-        """检查空闲超时，关闭Chrome实例但不退出服务"""
-        current_time = time.time()
-        if current_time - self.last_activity_time > self.config.chrome_idle_timeout:
-            if not self.active_tasks:
-                logger.info(f"服务空闲超过 {self.config.chrome_idle_timeout} 秒，清理资源...")
-                self._cleanup_chrome_processes()
-                # 不退出服务，保持运行
-                return False
-        return False
+    def _shutdown(self):
+        """关闭所有任务并清理资源"""
+        logger.info("正在关闭爬虫管理器...")
         
-    def _cleanup_chrome_processes(self):
-        """清理所有Chrome进程"""
+        # 杀死所有Chrome进程
+        self._kill_all_chrome_processes()
+        
+        # 等待所有任务线程结束
+        for task_id, task_info in self.running_tasks.items():
+            thread = task_info['thread']
+            logger.info(f"等待任务 {task_id} 结束...")
+            thread.join(timeout=5)
+        
+        logger.info("爬虫管理器已关闭")
+    
+    def _kill_all_chrome_processes(self):
+        """杀死所有Chrome进程"""
         try:
-            import subprocess
-            import os
-            import signal
-            
-            # 查找所有Chrome进程
-            logger.info("检查并清理所有Chrome进程...")
-            
-            # 使用ps命令查找Chrome相关进程
-            ps_cmd = "ps aux | grep -E 'chrome|chromedriver' | grep -v grep"
-            process = subprocess.Popen(ps_cmd, shell=True, stdout=subprocess.PIPE)
-            output, _ = process.communicate()
-            
-            if output:
-                lines = output.decode('utf-8').strip().split('\n')
-                for line in lines:
-                    parts = line.split()
-                    if len(parts) > 1:
-                        pid = parts[1]
-                        try:
-                            pid = int(pid)
-                            os.kill(pid, signal.SIGTERM)
-                            logger.info(f"终止Chrome相关进程: PID {pid}")
-                        except (ValueError, ProcessLookupError) as e:
-                            logger.error(f"无法终止进程 {pid}: {str(e)}")
-                logger.info("所有Chrome相关进程已清理")
-            else:
-                logger.info("没有发现运行中的Chrome进程")
-                
+            logger.info("关闭所有Chrome进程")
+            os.system("pkill -f chrome")
+            os.system("pkill -f chromium")
+            os.system("pkill -f chromedriver")
         except Exception as e:
-            logger.error(f"清理Chrome进程时出错: {str(e)}")
-            # 即使出错也不影响主服务运行
+            logger.error(f"杀死Chrome进程失败: {str(e)}")
+
+
+def main():
+    """主函数"""
+    try:
+        # 确保日志目录存在
+        os.makedirs('/logs', exist_ok=True)
+        
+        logger.info("启动无头Chrome爬虫服务")
+        
+        # 创建并启动爬虫管理器
+        manager = CrawlerManager()
+        manager.start()
+        
+    except Exception as e:
+        logger.error(f"主程序异常: {str(e)}")
+        logger.error(traceback.format_exc())
+        return 1
     
-    def _fetch_task(self) -> Optional[Dict]:
-        """从Redis队列获取任务"""
-        try:
-            task_data = self.redis_client.lpop(self.config.task_queue_key)
-            if task_data:
-                self.last_activity_time = time.time()
-                try:
-                    return json.loads(task_data)
-                except json.JSONDecodeError as e:
-                    logger.error(f"无法解析任务数据: {task_data}, 错误: {str(e)}")
-            return None
-        except redis.RedisError as e:
-            logger.error(f"从Redis获取任务时出错: {str(e)}")
-            return None
-    
-    def _save_result(self, result: Dict):
-        """将结果保存到Redis"""
-        try:
-            self.redis_client.rpush(self.config.result_queue_key, json.dumps(result))
-            logger.info(f"结果已保存到Redis: {result['task_id']}")
-        except redis.RedisError as e:
-            logger.error(f"保存结果到Redis时出错: {str(e)}")
-    
-    def _process_task(self, task_data: Dict):
-        """处理单个任务"""
-        task_id = str(int(time.time() * 1000))  # 使用时间戳作为任务ID
-        url = task_data.get("url")
-        
-        if not url:
-            logger.error(f"任务缺少URL: {task_data}")
-            return
-        
-        logger.info(f"处理任务: {task_id}, URL: {url}")
-        
-        # 记录任务详情
-        with self.active_tasks_lock:
-            self.task_details[task_id] = {
-                "url": url,
-                "start_time": datetime.now().isoformat(),
-                "status": "running",
-                "scroll_count": 0
-            }
-        
-        # 创建并执行Chrome任务
-        task = ChromeTask(task_id, url, self.config)
-        task.execute()
-        
-        # 保存结果
-        result = task.get_result()
-        self._save_result(result)
-        
-        # 清理任务
-        with self.active_tasks_lock:
-            if task_id in self.active_tasks:
-                del self.active_tasks[task_id]
-            if task_id in self.task_details:
-                del self.task_details[task_id]
-                
-        logger.info(f"任务完成: {task_id}, 状态: {result['status']}")
-    
-    def _start_task_thread(self, task_data: Dict):
-        """启动任务线程"""
-        task_id = str(int(time.time() * 1000))
-        
-        # 创建线程
-        thread = threading.Thread(
-            target=self._process_task,
-            args=(task_data,),
-            name=f"task-{task_id}"
-        )
-        
-        # 注册线程
-        with self.active_tasks_lock:
-            self.active_tasks[task_id] = thread
-        
-        # 启动线程
-        thread.start()
-        logger.info(f"启动任务线程: {task_id}")
-    
-    def _write_stats_to_log(self):
-        """将当前状态写入日志文件"""
-        try:
-            current_time = datetime.now().isoformat()
-            with self.active_tasks_lock:
-                active_count = len(self.active_tasks)
-                task_info = list(self.task_details.values())
-            
-            # 获取系统资源信息
-            mem_info = self._get_memory_usage()
-            cpu_info = self._get_cpu_usage()
-            
-            # 构建状态信息
-            stats = {
-                "timestamp": current_time,
-                "active_tasks": active_count,
-                "memory_usage_mb": mem_info,
-                "cpu_usage_percent": cpu_info,
-                "running_tasks": task_info
-            }
-            
-            # 写入日志文件
-            with open(self.config.stats_log_path, 'w') as f:
-                json.dump(stats, f, indent=2, ensure_ascii=False)
-                
-            logger.debug(f"已将状态信息写入: {self.config.stats_log_path}")
-            
-            # 设置下一次状态更新
-            self.stats_timer = threading.Timer(self.config.stats_update_interval, self._write_stats_to_log)
-            self.stats_timer.daemon = True
-            self.stats_timer.start()
-            
-        except Exception as e:
-            logger.error(f"写入状态日志时出错: {str(e)}")
-            # 即使出错也要继续定时器
-            self.stats_timer = threading.Timer(self.config.stats_update_interval, self._write_stats_to_log)
-            self.stats_timer.daemon = True
-            self.stats_timer.start()
-    
-    def _get_memory_usage(self):
-        """获取当前内存使用情况"""
-        try:
-            # 使用ps命令获取内存使用情况
-            cmd = "ps -o rss= -p %d" % os.getpid()
-            output = subprocess.check_output(cmd, shell=True).decode('utf-8').strip()
-            memory_kb = int(output)
-            memory_mb = memory_kb / 1024  # 转换为MB
-            return round(memory_mb, 2)
-        except Exception as e:
-            logger.error(f"获取内存使用情况时出错: {str(e)}")
-            return 0
-    
-    def _get_cpu_usage(self):
-        """获取CPU使用率"""
-        try:
-            # 使用top命令获取CPU使用率
-            cmd = f"top -b -n 1 -p {os.getpid()} | grep {os.getpid()}"
-            output = subprocess.check_output(cmd, shell=True).decode('utf-8')
-            cpu_usage = float(output.split()[8])
-            return cpu_usage
-        except Exception as e:
-            logger.error(f"获取CPU使用率时出错: {str(e)}")
-            return 0
-    
-    def run(self):
-        """运行服务主循环，永久运行"""
-        logger.info("无头Chrome服务启动...")
-        
-        # 启动时清理可能存在的Chrome进程
-        self._cleanup_chrome_processes()
-        
-        # 启动状态统计定时器
-        self._write_stats_to_log()
-        
-        while True:  # 永久运行，不使用self.running标志
-            try:
-                # 检查空闲超时，只清理资源不退出
-                self._check_idle_timeout()
-                
-                # 检查是否可以接受新任务
-                with self.active_tasks_lock:
-                    active_task_count = len(self.active_tasks)
-                
-                if active_task_count >= self.config.max_concurrent_tasks:
-                    logger.debug(f"当前活跃任务数 {active_task_count} 已达到最大值 {self.config.max_concurrent_tasks}，等待...")
-                    time.sleep(1)
-                    continue
-                
-                # 获取任务
-                task_data = self._fetch_task()
-                
-                if not task_data:
-                    # 没有任务，等待一段时间
-                    time.sleep(1)
-                    continue
-                
-                # 启动任务
-                self._start_task_thread(task_data)
-                
-            except Exception as e:
-                logger.error(f"服务循环中出现未处理的异常: {str(e)}")
-                time.sleep(5)  # 避免错误循环过快
-                
-                # 即使出错也继续运行
-        
-        # 注意：这行代码实际上永远不会执行，因为我们使用了无限循环
-        logger.info("服务主循环结束")
+    return 0
+
 
 if __name__ == "__main__":
-    service = HeadlessChromeService()
-    service.run()
+    sys.exit(main())

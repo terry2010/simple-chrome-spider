@@ -15,14 +15,23 @@ queue里的数据格式为 {"url":"http://网址","add_time":"这个不用处理
  1. 使用无头Chrome打开URL
  2. 每隔3秒向下滚动一页（类似PageDown效果）
  3. 1分钟后关闭URL
- 4. 在闲时关闭Chrome以节省服务器资源
+ 4. 在没有任务的时候关闭所有chrome以节省服务器资源，关闭后容器需要保持运行状态
 # 设计流程：
  1. 有一个持续写入任务URL的Redis队列
  2. 服务会不断消耗这个队列
  3. 每当有新任务时，就启动一个新的Chrome浏览该URL一分钟
- 4. 队列中数据格式为 {"url":"http://网址","add_time":"这个不用处理"}
+ 4. 队列中数据格式为 {"url":"http://网址","add_time":"这个不用处理","task":[$task_配置，"callback_url":"", "callback_data":["screenshot", "page_source", "title", "console_log"]}
  5. 处理完后将结果存储到Redis的另一个队列中
-# 编程语言：Python
+ 6. $task_配置为打开url后 这次任务的配置，是个数组，每个元素是一个任务。比如一个典型任务为：
+      [{"do":"page_down"},
+      {"do":"sleep", "time":3},
+      {"do":"page_down"},
+      {"do":"sleep", "time":3}
+      {"do":"screenshot"}
+      ]
+ 7. callback_url 为处理后的结果会发送到这个url
+ 8. callback_data 为处理后的自定义结果, callback_data 里一定有启动时间，总浏览时间， 启动url， 每次跳转的url列表+跳转时间，最终跳url。这个数组里定义了除了刚才提到的默认值外的自定义值， 目前支持 screenshot:base64后的截图， page_source:html源码， title:页面标题， html:html源码, console_log:控制台输出
+  编程语言：Python
 # 需要频控策略，能设置服务器最多同时启动多少个Chrome任务等
 # 服务器不支持docker-compose和k8s，希望在新服务器上启动一个Docker容器即可运行
 # 启动容器时可以指定参数，如最大任务数、最大内存、Redis服务器IP和密码等
